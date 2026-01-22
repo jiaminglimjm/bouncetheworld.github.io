@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <body style="margin:0;overflow:hidden">
+    <script type="module">
+      import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js";
+
+      const r = new THREE.WebGLRenderer({antialias:true});
+      r.setSize(innerWidth, innerHeight);
+      document.body.appendChild(r.domElement);
+
+      const s = new THREE.Scene();
+      const c = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
+      c.position.z = 3;
+
+      s.add(new THREE.Mesh(
+        new THREE.SphereGeometry(1, 64, 64),
+        new THREE.MeshNormalMaterial()
+      ));
+
+      addEventListener("resize", () => {
+        c.aspect = innerWidth/innerHeight;
+        c.updateProjectionMatrix();
+        r.setSize(innerWidth, innerHeight);
+      });
+
+      (function anim(){
+        requestAnimationFrame(anim);
+        r.render(s, c);
+      })();
+    </script>
+  </body>
+</html>

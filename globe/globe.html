@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mercator JPG → Interactive Globe</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; }
+    #ui {
+      position: fixed; left: 12px; top: 12px; z-index: 10;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #e8ecff; background: rgba(0,0,0,0.45);
+      padding: 10px 12px; border-radius: 12px; backdrop-filter: blur(6px);
+      max-width: min(520px, calc(100vw - 24px));
+    }
+    #ui small { display: block; opacity: 0.85; margin-top: 6px; line-height: 1.3; }
+    #ui code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    #file { margin-left: 8px; }
+    #hint { margin-top: 8px; font-size: 12px; opacity: 0.9; }
+    a { color: #b7c6ff; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div>
+      <b>Mercator JPG → Globe</b>
+      <input id="file" type="file" accept="image/jpeg,image/png,image/webp" />
+    </div>
+    <small>
+      If you don’t pick a file, it tries to load <code>map.jpg</code> next to this HTML.
+      <br/>Drag to rotate • Scroll to zoom
+    </small>
+    <div id="hint"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/controls/OrbitControls.js";
+
+    // Change this if your filename differs, OR define window.MAP_URL before this script runs.
+    const DEFAULT_MAP_URL = (window.MAP_URL && typeof window.MAP_URL === "string")
+      ? window.MAP_URL
+      : "map.jpg";
+
+    const hintEl = document.getElementById("hint");
+    const fileEl = document.getElementById("file");
+
+    // ---- Three.js setup
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 200);
+    camera.position.set(0, 0, 3.0);
+
+    // Nice subtle light just to avoid total flatness if you later add atmosphere
+    scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.enablePan = false;
+    controls.minDistance = 1.4;
+    controls.maxDistance = 10.0;
+    controls.rotateSpeed = 0.6;
+    controls.zoomSpeed = 0.9;
+
+    // ---- Mercator sampling shader
+    // Sphere UVs in Three are equirectangular-like:
+    //   u = lon normalized [0..1]
+    //   v = lat normalized [0..1] (north ~1, south ~0)
+    //
+    // But your image is Mercator in Y:
+    //   y = ln(tan(pi/4 + lat/2))
+    // normalized using y range [-pi..pi] (Web Mercator limits at ±85.0511°).
+    const MAX_MERCATOR_LAT = 85.05112878 * Math.PI / 180.0; // ~1.48442223 rad
+
+    const mercatorMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uMap: { value: null },
+        uMaxLat: { value: MAX_MERCATOR_LAT }
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        varying vec2 vUv;
+        uniform sampler2D uMap;
+        uniform float uMaxLat;
+
+        const float PI = 3.1415926535897932384626433832795;
+
+        // Safe mercator Y from latitude (radians).
+        float mercatorY(float lat) {
+          // Clamp to Web Mercator max latitude to avoid infinity.
+          lat = clamp(lat, -uMaxLat, uMaxLat);
+          return log(tan(PI * 0.25 + lat * 0.5));
+        }
+
+        void main() {
+          // Convert sphere UV -> lat (radians)
+          // vUv.y: 1 at north, 0 at south
+          float lat = (vUv.y - 0.5) * PI;
+
+          // Convert lat -> mercator normalized v in [0..1]
+          // Web Mercator y range is approx [-PI, PI] at ±85.0511°
+          float y = mercatorY(lat);
+          float vMerc = 0.5 - (y / (2.0 * PI));
+          float uMerc = vUv.x;
+
+          vec4 tex = texture2D(uMap, vec2(uMerc, vMerc));
+
+          // If your JPEG is already in sRGB, Three.js will handle conversion
+          // via renderer.outputColorSpace; keep as-is.
+          gl_FragColor = tex;
+        }
+      `
+    });
+
+    // Geometry: keep segments reasonable for performance (doesn't affect texture detail)
+    const globe = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 128, 128),
+      mercatorMaterial
+    );
+    scene.add(globe);
+
+    // ---- Loading / scaling logic (handles 21600px > maxTextureSize)
+    function setHint(msg) { hintEl.textContent = msg; }
+
+    async function loadImageBitmap(urlOrObjectUrl) {
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = reject;
+        i.src = urlOrObjectUrl;
+      });
+
+      // createImageBitmap is generally faster & avoids some memory overhead.
+      // (If it fails in a browser, we’ll fall back later.)
+      try {
+        return await createImageBitmap(img);
+      } catch {
+        return img; // fallback to HTMLImageElement
+      }
+    }
+
+    function drawToCanvasScaled(src, targetW, targetH) {
+      const canvas = document.createElement("canvas");
+      console.log("hi drawToCanvas");
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      // Good scaling quality:
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(src, 0, 0, targetW, targetH);
+      return canvas;
+    }
+
+    async function makeTextureFromSource(src) {
+      const maxTex = renderer.capabilities.maxTextureSize;
+
+      // Determine source dimensions
+      const srcW = src.width ?? src.naturalWidth;
+      const srcH = src.height ?? src.naturalHeight;
+
+      let finalSource = src;
+      let outW = srcW, outH = srcH;
+
+      if (srcW > maxTex || srcH > maxTex) {
+        const scale = Math.min(maxTex / srcW, maxTex / srcH);
+        outW = Math.max(1, Math.floor(srcW * scale));
+        outH = Math.max(1, Math.floor(srcH * scale));
+        finalSource = drawToCanvasScaled(src, outW, outH);
+        setHint(`Downscaled to ${outW}×${outH} (GPU max texture size: ${maxTex}).`);
+      } else {
+        setHint(`Loaded ${srcW}×${srcH} (GPU max texture size: ${maxTex}).`);
+      }
+
+      const tex = new THREE.Texture(finalSource);
+      tex.colorSpace = THREE.SRGBColorSpace; // JPEG is typically sRGB
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.anisotropy = Math.min(renderer.capabilities.getMaxAnisotropy(), 8);
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+      tex.needsUpdate = true;
+
+      return tex;
+    }
+
+    async function loadMap(urlOrObjectUrl) {
+      setHint("Loading image… (this can take a moment for very large files)");
+      console.log("hi loadMap");
+      const src = await loadImageBitmap(urlOrObjectUrl);
+      const tex = await makeTextureFromSource(src);
+
+      // Dispose previous map if any
+      const old = mercatorMaterial.uniforms.uMap.value;
+      if (old) old.dispose();
+
+      mercatorMaterial.uniforms.uMap.value = tex;
+      mercatorMaterial.needsUpdate = true;
+    }
+
+    // Default load: tries map.jpg next to the HTML
+    loadMap(DEFAULT_MAP_URL).catch(err => {
+      console.error(err);
+      setHint(`Could not load "${DEFAULT_MAP_URL}". Use the file picker or run a local server.`);
+    });
+
+    // File picker: load local image via object URL (best for big files)
+    fileEl.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const objUrl = URL.createObjectURL(file);
+      try {
+        await loadMap(objUrl);
+      } finally {
+        // Revoke later to keep texture alive; safe enough after a short delay.
+        setTimeout(() => URL.revokeObjectURL(objUrl), 30_000);
+      }
+    });
+
+    // Resize handler
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Render loop
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
