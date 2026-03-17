@@ -91,7 +91,7 @@
         const textureLoader = new THREE.TextureLoader();
 
         // Load default texture initially
-        let currentTexture = textureLoader.load('./map.jpg');
+        let currentTexture = textureLoader.load('./map.png');
         currentTexture.colorSpace = THREE.SRGBColorSpace;
 
         const material = new THREE.MeshBasicMaterial({ map: currentTexture });
